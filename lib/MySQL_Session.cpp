@@ -3712,338 +3712,289 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 	}
 }
 
-bool MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_qpo(PtrSize_t *pkt, bool prepared) {
-	unsigned char command_type=*((unsigned char *)pkt->ptr+sizeof(mysql_hdr));
+void MySQL_Session::SetSqlMode(const char *s)
+{
+	auto & opt = client_myds->myconn->options;
+	uint32_t sql_mode_int = SpookyHash::Hash32(s, strlen(s), 10);
+	if (opt.sql_mode_int == sql_mode_int)
+		return;
+
+	opt.sql_mode_int = sql_mode_int;
+	free(opt.sql_mode);
+	opt.sql_mode = strdup(s);
+}
+
+void MySQL_Session::SetTimeZone(const char *s)
+{
+	auto & opt = client_myds->myconn->options;
+	uint32_t time_zone_int = SpookyHash::Hash32(s, strlen(s), 10);
+	if (opt.time_zone_int == time_zone_int)
+		return;
+
+	opt.time_zone_int = time_zone_int;
+	free(opt.time_zone);
+	opt.time_zone = strdup(s);
+}
+
+uint16_t MySQL_Session::GetServerStatus() const
+{
+	uint16_t r = 0;
+	if (NumActiveTransactions())
+		r += SERVER_STATUS_IN_TRANS;
+	if (autocommit)
+		r += SERVER_STATUS_AUTOCOMMIT;
+	return r;
+}
+
+bool MySQL_Session::HandlerSendOK(uint command_type, PtrSize_t *pkt)
+{
+	if (command_type != _MYSQL_COM_QUERY)
+		return false;
+	client_myds->DSS = STATE_QUERY_SENT_NET;
+	client_myds->myprot.generate_pkt_OK(true, NULL, NULL, 1, 0, 0, GetServerStatus(), 0, NULL);
+	client_myds->DSS = STATE_SLEEP;
+	status = WAITING_CLIENT_DATA;
+	l_free(pkt->size, pkt->ptr);
+	RequestEnd(NULL);
+	return true;
+}
+
+void MySQL_Session::UpdateFromQPO()
+{
+	if (qpo->next_query_flagIN >= 0)
+		next_query_flagIN = qpo->next_query_flagIN;
+	if (qpo->destination_hostgroup >= 0 && transaction_persistent_hostgroup == -1)
+		current_hostgroup = qpo->destination_hostgroup;
+}
+
+bool MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_qpo(PtrSize_t *pkt, bool prepared)
+{
+	uchar command_type = *((uchar *)pkt->ptr + sizeof(mysql_hdr));
+
+	// the query was rewritten
+	// free old packet, allocate and build new packet
 	if (qpo->new_query) {
-		// the query was rewritten
-		l_free(pkt->size,pkt->ptr);	// free old pkt
-		// allocate new pkt
+		l_free(pkt->size, pkt->ptr);	// free old pkt
+
 		timespec begint;
-		if (thread->variables.stats_time_query_processor) {
-			clock_gettime(CLOCK_THREAD_CPUTIME_ID,&begint);
-		}
-		pkt->size=sizeof(mysql_hdr)+1+qpo->new_query->length();
-		pkt->ptr=l_alloc(pkt->size);
+		if (thread->variables.stats_time_query_processor)
+			clock_gettime(CLOCK_THREAD_CPUTIME_ID, &begint);
+
+		pkt->size = sizeof(mysql_hdr) + 1 + qpo->new_query->length();
+		pkt->ptr = l_alloc(pkt->size);
+
 		mysql_hdr hdr;
-		hdr.pkt_id=0;
-		hdr.pkt_length=pkt->size-sizeof(mysql_hdr);
-		memcpy((unsigned char *)pkt->ptr, &hdr, sizeof(mysql_hdr)); // copy header
-		unsigned char *c=(unsigned char *)pkt->ptr+sizeof(mysql_hdr);
-		*c=(unsigned char)_MYSQL_COM_QUERY; // set command type
-		memcpy((unsigned char *)pkt->ptr+sizeof(mysql_hdr)+1,qpo->new_query->data(),qpo->new_query->length()); // copy query
+		hdr.pkt_id = 0;
+		hdr.pkt_length = pkt->size - sizeof(mysql_hdr);
+		memcpy((uchar *)pkt->ptr, &hdr, sizeof(mysql_hdr)); // copy header
+		uchar *c = (uchar *)pkt->ptr + sizeof(mysql_hdr);
+		*c++ = (uchar)_MYSQL_COM_QUERY; // set command type
+		memcpy(c, qpo->new_query->data(), qpo->new_query->length()); // copy query
+
 		CurrentQuery.query_parser_free();
-		CurrentQuery.begin((unsigned char *)pkt->ptr,pkt->size,true);
+		CurrentQuery.begin((uchar *)pkt->ptr, pkt->size, true);
 		delete qpo->new_query;
+
 		timespec endt;
 		if (thread->variables.stats_time_query_processor) {
-			clock_gettime(CLOCK_THREAD_CPUTIME_ID,&endt);
-			thread->status_variables.query_processor_time=thread->status_variables.query_processor_time +
-				(endt.tv_sec*1000000000+endt.tv_nsec) -
-				(begint.tv_sec*1000000000+begint.tv_nsec);
+			clock_gettime(CLOCK_THREAD_CPUTIME_ID, &endt);
+			thread->status_variables.query_processor_time +=
+				(endt.tv_sec*1000000000 + endt.tv_nsec) -
+				(begint.tv_sec*1000000000 + begint.tv_nsec);
 		}
 	}
 
+	// ER_NET_PACKET_TOO_LARGE
 	if (pkt->size > (unsigned int) mysql_thread___max_allowed_packet) {
-		// ER_NET_PACKET_TOO_LARGE
-		client_myds->DSS=STATE_QUERY_SENT_NET;
-		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,client_myds->pkt_sid+1,1153,(char *)"08S01",(char *)"Got a packet bigger than 'max_allowed_packet' bytes");
-		l_free(pkt->size,pkt->ptr);
+		client_myds->DSS = STATE_QUERY_SENT_NET;
+		client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid + 1,
+			1153, "08S01", "Got a packet bigger than 'max_allowed_packet' bytes");
+		l_free(pkt->size, pkt->ptr);
 		RequestEnd(NULL);
 		return true;
 	}
 
 	if (qpo->OK_msg) {
-		client_myds->DSS=STATE_QUERY_SENT_NET;
-		unsigned int nTrx=NumActiveTransactions();
-		uint16_t setStatus = (nTrx ? SERVER_STATUS_IN_TRANS : 0 );
-		if (autocommit) setStatus += SERVER_STATUS_AUTOCOMMIT;
-		client_myds->myprot.generate_pkt_OK(true,NULL,NULL,client_myds->pkt_sid+1,0,0,setStatus,0,qpo->OK_msg);
-		l_free(pkt->size,pkt->ptr);
+		client_myds->DSS = STATE_QUERY_SENT_NET;
+		client_myds->myprot.generate_pkt_OK(true, NULL, NULL, client_myds->pkt_sid + 1,
+			0, 0, GetServerStatus(), 0, qpo->OK_msg);
+		l_free(pkt->size, pkt->ptr);
 		RequestEnd(NULL);
 		return true;
 	}
 
 	if (qpo->error_msg) {
-		client_myds->DSS=STATE_QUERY_SENT_NET;
-		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,client_myds->pkt_sid+1,1148,(char *)"42000",qpo->error_msg);
-		l_free(pkt->size,pkt->ptr);
+		client_myds->DSS = STATE_QUERY_SENT_NET;
+		client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid + 1,
+			1148, "42000", qpo->error_msg);
+		l_free(pkt->size, pkt->ptr);
 		RequestEnd(NULL);
 		return true;
 	}
 
-	if (prepared) {	// for prepared statement we exit here
-		goto __exit_set_destination_hostgroup;
-	}
-
-	// handle here #509, #815 and #816
-	if (CurrentQuery.QueryParserArgs.digest_text) {
-		char *dig=CurrentQuery.QueryParserArgs.digest_text;
-		unsigned int nTrx=NumActiveTransactions();
-		if (strncasecmp(dig,(char *)"SET ",4)==0) {
-			int rc;
-			string nq=string((char *)CurrentQuery.QueryPointer,CurrentQuery.QueryLength);
-			RE2::GlobalReplace(&nq,(char *)"^/\\*!\\d\\d\\d\\d\\d SET(.*)\\*/",(char *)"SET\\1");
-			RE2::GlobalReplace(&nq,(char *)"(?U)/\\*.*\\*/",(char *)"");
-			if (match_regexes && match_regexes[0]->match(dig)) {
-				re2::RE2::Options *opt2=new re2::RE2::Options(RE2::Quiet);
-				opt2->set_case_sensitive(false);
-				char *pattern=(char *)"(?: *)SET *(?:|SESSION +|@@|@@session.)SQL_LOG_BIN *(?:|:)= *(\\d+) *(?:(|;|-- .*|#.*))$";
-				re2::RE2 *re=new RE2(pattern, *opt2);
-				int i;
-				rc=RE2::PartialMatch(nq, *re, &i);
-				delete re;
-				delete opt2;
-				if (rc && ( i==0 || i==1) ) {
-					//fprintf(stderr,"sql_log_bin=%d\n", i);
-					client_myds->myconn->options.sql_log_bin=i;
-					if (command_type == _MYSQL_COM_QUERY) {
-						client_myds->DSS=STATE_QUERY_SENT_NET;
-						uint16_t setStatus = (nTrx ? SERVER_STATUS_IN_TRANS : 0 );
-						if (autocommit) setStatus= SERVER_STATUS_AUTOCOMMIT;
-						client_myds->myprot.generate_pkt_OK(true,NULL,NULL,1,0,0,setStatus,0,NULL);
-						client_myds->DSS=STATE_SLEEP;
-						status=WAITING_CLIENT_DATA;
-						l_free(pkt->size,pkt->ptr);
-						RequestEnd(NULL);
-						return true;
-					}
-				} else {
-					proxy_error("Unable to parse query. If correct, report it as a bug: %s\n", nq.c_str());
-					return false;
-				}
-			}
-			if (match_regexes && match_regexes[1]->match(dig)) {
-			{
-				int query_no_space_length = nq.length();
-				char *query_no_space=(char *)malloc(query_no_space_length+1);
-				memcpy(query_no_space,nq.c_str(),query_no_space_length);
-				query_no_space[query_no_space_length]='\0';
-				query_no_space_length=remove_spaces(query_no_space);
-				nq = string(query_no_space);
-				free(query_no_space);
-			}
-				// set sql_mode
-				re2::RE2::Options *opt2=new re2::RE2::Options(RE2::Quiet);
-				opt2->set_case_sensitive(false);
-				char *pattern=(char *)"^(?: *)SET *(?:|SESSION +|@@|@@session.)SQL_MODE *(?:|:)= *(?:'||\")((\\w|,)*)(?:'||\") *(?:(|;|-- .*|#.*))$";
-				re2::RE2 *re=new RE2(pattern, *opt2);
-				string s;
-				rc=RE2::PartialMatch(nq, *re, &s);
-				delete re;
-				delete opt2;
-				if (rc) {
-					//fprintf(stderr,"sql_mode='%s'\n", s.c_str());
-					uint32_t sql_mode_int=SpookyHash::Hash32(s.c_str(),s.length(),10);
-					if (client_myds->myconn->options.sql_mode_int != sql_mode_int) {
-						//fprintf(stderr,"sql_mode_int='%u'\n", sql_mode_int);
-						client_myds->myconn->options.sql_mode_int = sql_mode_int;
-						if (client_myds->myconn->options.sql_mode) {
-							free(client_myds->myconn->options.sql_mode);
-						}
-						client_myds->myconn->options.sql_mode=strdup(s.c_str());
-					}
-					if (command_type == _MYSQL_COM_QUERY) {
-						client_myds->DSS=STATE_QUERY_SENT_NET;
-						uint16_t setStatus = (nTrx ? SERVER_STATUS_IN_TRANS : 0 );
-						if (autocommit) setStatus= SERVER_STATUS_AUTOCOMMIT;
-						client_myds->myprot.generate_pkt_OK(true,NULL,NULL,1,0,0,setStatus,0,NULL);
-						client_myds->DSS=STATE_SLEEP;
-						status=WAITING_CLIENT_DATA;
-						l_free(pkt->size,pkt->ptr);
-						RequestEnd(NULL);
-						return true;
-					}
-				} else {
-					// try case listed in #1279
-					// this is not a complete solution. A right solution involves true parsing
-					re2::RE2::Options *opt2=new re2::RE2::Options(RE2::Quiet);
-					opt2->set_case_sensitive(false);
-					char *pattern=(char *)"^(?: *)SET *(?:|SESSION +|@@|@@session.)SQL_MODE *(?:|:)= *(?:'||\")((\\w|,)*)(?:'||\")(?: *, *NAMES *)(?:'||\")((\\w|\\d)*)(?:'||\")(?:| +COLLATE +(?:'||\")((\\w|\\d)*)(?:'||\")) *(?:(|;|-- .*|#.*))$";
-					re2::RE2 *re=new RE2(pattern, *opt2);
-					string s1;
-					string s2;
-					string s3;
-					rc=RE2::FullMatch(nq, *re, &s1, (void *)NULL, &s2, (void *)NULL, &s3);
-					//proxy_info("s1 = %s\n",s1.c_str());
-					//proxy_info("s2 = %s\n",s2.c_str());
-					//proxy_info("s3 = %s\n",s3.c_str());
-					delete re;
-					delete opt2;
-					if (rc) {
-						const MARIADB_CHARSET_INFO * c;
-						if (s3.length()) {
-							c = proxysql_find_charset_collate_names(s2.c_str(), s3.c_str());
-						} else {
-							c = proxysql_find_charset_name(s2.c_str());
-						}
-						if (!c) {
-							char *m = NULL;
-							char *errmsg = NULL;
-							if (s3.length()) {
-								m=(char *)"Unknown character set '%s' or collation '%s'";
-								errmsg=(char *)malloc(s2.length() + s3.length() + strlen(m));
-								sprintf(errmsg,m,s2.c_str(), s3.c_str());
-							} else {
-								m=(char *)"Unknown character set: '%s'";
-								errmsg=(char *)malloc(s2.length()+strlen(m));
-								sprintf(errmsg,m,s2.c_str());
-							}
-							client_myds->DSS=STATE_QUERY_SENT_NET;
-							client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1115,(char *)"42000",errmsg);
-							free(errmsg);
-							return true;
-						} else {
-							uint32_t sql_mode_int=SpookyHash::Hash32(s1.c_str(),s1.length(),10);
-							if (client_myds->myconn->options.sql_mode_int != sql_mode_int) {
-								client_myds->myconn->options.sql_mode_int = sql_mode_int;
-								if (client_myds->myconn->options.sql_mode) {
-									free(client_myds->myconn->options.sql_mode);
-								}
-								client_myds->myconn->options.sql_mode=strdup(s1.c_str());
-							}
-							client_myds->myconn->set_charset(c->nr);
-							if (command_type == _MYSQL_COM_QUERY) {
-								client_myds->DSS=STATE_QUERY_SENT_NET;
-								uint16_t setStatus = (nTrx ? SERVER_STATUS_IN_TRANS : 0 );
-								if (autocommit) setStatus= SERVER_STATUS_AUTOCOMMIT;
-								client_myds->myprot.generate_pkt_OK(true,NULL,NULL,1,0,0,setStatus,0,NULL);
-									client_myds->DSS=STATE_SLEEP;
-								status=WAITING_CLIENT_DATA;
-								l_free(pkt->size,pkt->ptr);
-								RequestEnd(NULL);
-								return true;
-							}
-						}
-					} else {
-						// try case listed in #1373
-						// SET  @@SESSION.sql_mode = CONCAT(CONCAT(@@sql_mode, ',STRICT_ALL_TABLES'), ',NO_AUTO_VALUE_ON_ZERO'),  @@SESSION.sql_auto_is_null = 0, @@SESSION.wait_timeout = 2147483
-						// this is not a complete solution. A right solution involves true parsing
-						int query_no_space_length = nq.length();
-						char *query_no_space=(char *)malloc(query_no_space_length+1);
-						memcpy(query_no_space,nq.c_str(),query_no_space_length);
-						query_no_space[query_no_space_length]='\0';
-						query_no_space_length=remove_spaces(query_no_space);
-
-						string nq1 = string(query_no_space);
-						free(query_no_space);
-						RE2::GlobalReplace(&nq1,(char *)"SESSION.",(char *)"");
-						RE2::GlobalReplace(&nq1,(char *)"SESSION ",(char *)"");
-						RE2::GlobalReplace(&nq1,(char *)"session.",(char *)"");
-						RE2::GlobalReplace(&nq1,(char *)"session ",(char *)"");
-						//fprintf(stderr,"%s\n",nq1.c_str());
-						re2::RE2::Options *opt2=new re2::RE2::Options(RE2::Quiet);
-						opt2->set_case_sensitive(false);
-						char *pattern=(char *)"^SET @@SQL_MODE *(?:|:)= *(?:'||\")(.*)(?:'||\") *, *@@sql_auto_is_null *(?:|:)= *(?:(?:\\w|\\d)*) *, @@wait_timeout *(?:|:)= *(?:\\d*)$";
-						re2::RE2 *re=new RE2(pattern, *opt2);
-						string s1;
-						rc=RE2::FullMatch(nq1, *re, &s1);
-						delete re;
-						delete opt2;
-						if (rc) {
-							uint32_t sql_mode_int=SpookyHash::Hash32(s1.c_str(),s1.length(),10);
-							if (client_myds->myconn->options.sql_mode_int != sql_mode_int) {
-								client_myds->myconn->options.sql_mode_int = sql_mode_int;
-								if (client_myds->myconn->options.sql_mode) {
-									free(client_myds->myconn->options.sql_mode);
-								}
-								client_myds->myconn->options.sql_mode=strdup(s.c_str());
-							}
-							if (command_type == _MYSQL_COM_QUERY) {
-								client_myds->DSS=STATE_QUERY_SENT_NET;
-								uint16_t setStatus = (nTrx ? SERVER_STATUS_IN_TRANS : 0 );
-								if (autocommit) setStatus= SERVER_STATUS_AUTOCOMMIT;
-								client_myds->myprot.generate_pkt_OK(true,NULL,NULL,1,0,0,setStatus,0,NULL);
-								client_myds->DSS=STATE_SLEEP;
-								status=WAITING_CLIENT_DATA;
-								l_free(pkt->size,pkt->ptr);
-								RequestEnd(NULL);
-								return true;
-							}
-						} else {
-							proxy_error("Unable to parse query. If correct, report it as a bug: %s\n", nq.c_str());
-							return false;
-						}
-					}
-				}
-			}
-			if (match_regexes && match_regexes[2]->match(dig)) {
-				// set time_zone
-				re2::RE2::Options *opt2=new re2::RE2::Options(RE2::Quiet);
-				opt2->set_case_sensitive(false);
-				char *pattern=(char *)"^(?: *)SET *(?:|SESSION +|@@|@@session.)TIME_ZONE *(?:|:)= *(?:'||\")((\\w|/|:|\\d|\\+|-)*)(?:'||\") *(?:(|;|-- .*|#.*))$";
-				re2::RE2 *re=new RE2(pattern, *opt2);
-				string s;
-				rc=RE2::PartialMatch(nq, *re, &s);
-				delete re;
-				delete opt2;
-				if (rc) {
-					//fprintf(stderr,"time_zone='%s'\n", s.c_str());
-					uint32_t time_zone_int=SpookyHash::Hash32(s.c_str(),s.length(),10);
-					if (client_myds->myconn->options.time_zone_int != time_zone_int) {
-						//fprintf(stderr,"time_zone_int='%u'\n", time_zone_int);
-						client_myds->myconn->options.time_zone_int = time_zone_int;
-						if (client_myds->myconn->options.time_zone) {
-							free(client_myds->myconn->options.time_zone);
-						}
-						client_myds->myconn->options.time_zone=strdup(s.c_str());
-					}
-					if (command_type == _MYSQL_COM_QUERY) {
-						client_myds->DSS=STATE_QUERY_SENT_NET;
-						uint16_t setStatus = (nTrx ? SERVER_STATUS_IN_TRANS : 0 );
-						if (autocommit) setStatus += SERVER_STATUS_AUTOCOMMIT;
-						client_myds->myprot.generate_pkt_OK(true,NULL,NULL,1,0,0,setStatus,0,NULL);
-						client_myds->DSS=STATE_SLEEP;
-						status=WAITING_CLIENT_DATA;
-						l_free(pkt->size,pkt->ptr);
-						RequestEnd(NULL);
-						return true;
-					}
-				} else {
-					proxy_error("Unable to parse query. If correct, report it as a bug: %s\n", nq.c_str());
-					return false;
-				}
-			}
-		}
-	}
-
-	if (mirror==true) { // for mirror session we exit here
-		current_hostgroup=qpo->destination_hostgroup;
+	// for prepared statement we exit here
+	if (prepared) {
+		UpdateFromQPO();
 		return false;
 	}
-	if (qpo->cache_ttl>0) {
-		uint32_t resbuf=0;
-		unsigned char *aa=GloQC->get(
-			client_myds->myconn->userinfo->hash,
-			(const unsigned char *)CurrentQuery.QueryPointer ,
-			CurrentQuery.QueryLength ,
-			&resbuf ,
-			thread->curtime/1000
-		);
-		if (aa) {
-			l_free(pkt->size,pkt->ptr);
-			client_myds->buffer2resultset(aa,resbuf);
-			free(aa);
-			client_myds->PSarrayOUT->copy_add(client_myds->resultset,0,client_myds->resultset->len);
-			while (client_myds->resultset->len) client_myds->resultset->remove_index(client_myds->resultset->len-1,NULL);
-			if (transaction_persistent_hostgroup == -1) {
-				// not active, we can change it
-				current_hostgroup=-1;
+
+	// handle a few SET variants here (see #509, #815, #816 etc)
+	for (;;)
+	{
+		char *dig = CurrentQuery.QueryParserArgs.digest_text;
+		if (!dig || strncasecmp(dig, "SET ", 4) || !match_regexes)
+			break;
+
+		// remove version comment
+		string nq = string((char *)CurrentQuery.QueryPointer, CurrentQuery.QueryLength);
+		RE2::GlobalReplace(&nq, "^/\\*!\\d\\d\\d\\d\\d SET(.*)\\*/", "SET\\1");
+		RE2::GlobalReplace(&nq, "(?U)/\\*.*\\*/", "");
+
+		// my regexp options
+		re2::RE2::Options opt2(RE2::Quiet);
+		opt2.set_case_sensitive(false);
+
+		// handle SET ... SQL_LOG_BIN
+		if (match_regexes[0]->match(dig)) {
+			re2::RE2 re("(?: *)SET *(?:|SESSION +|@@|@@session.)SQL_LOG_BIN"
+				" *(?:|:)= *(\\d+) *(?:(|;|-- .*|#.*))$", opt2);
+
+			int i;
+			int rc = RE2::PartialMatch(nq, re, &i);
+			if (rc && (i == 0 || i == 1)) {
+				client_myds->myconn->options.sql_log_bin  =i;
+				if (HandlerSendOK(command_type, pkt))
+					return true;
+			} else {
+				proxy_error("Unable to parse query. If correct, report it as a bug: %s\n", nq.c_str());
+				return false;
 			}
+			break;
+		}
+
+		// handle SET ... SQL_MODE
+		if (match_regexes[1]->match(dig)) {
+			// FIXME: make a proper variant for std::string()
+			string t = nq;
+			remove_spaces(t.c_str()); // HACK, here we use 't' as an easy temp buffer
+			nq = t.c_str();
+
+			// set sql_mode
+			re2::RE2 re("^(?: *)SET *(?:|SESSION +|@@|@@session.)SQL_MODE"
+				" *(?:|:)= *(?:'||\")((\\w|,)*)(?:'||\") *(?:(|;|-- .*|#.*))$", opt2);
+
+			string s;
+			if (RE2::PartialMatch(nq, re, &s)) {
+				SetSqlMode(s.c_str());
+				if (HandlerSendOK(command_type, pkt))
+					return true;
+				break;
+			}
+
+			// try case listed in #1279
+			// this is not a complete solution. A right solution involves true parsing
+			re2::RE2 r2("^(?: *)SET *(?:|SESSION +|@@|@@session.)SQL_MODE *"
+				"(?:|:)= *(?:'||\")((\\w|,)*)(?:'||\")"
+				"(?: *, *NAMES *)(?:'||\")((\\w|\\d)*)"
+				"(?:'||\")(?:| +COLLATE +(?:'||\")((\\w|\\d)*)(?:'||\")) *"
+				"(?:(|;|-- .*|#.*))$", opt2);
+			string s1, s2, s3;
+			if (RE2::FullMatch(nq, r2, &s1, (void *)NULL, &s2, (void *)NULL, &s3)) {
+				const MARIADB_CHARSET_INFO * c = s3.length()
+					? proxysql_find_charset_collate_names(s2.c_str(), s3.c_str())
+					: proxysql_find_charset_name(s2.c_str());
+
+				if (!c) {
+					string err = "Unknown character set '" + s2 + "'";
+					if (s3.length())
+						err = err + "or collation '" + s3 + "'";
+
+					client_myds->DSS = STATE_QUERY_SENT_NET;
+					client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, 1,
+						1115, "42000", err.c_str());
+					return true;
+				} else {
+					SetSqlMode(s1.c_str());
+					client_myds->myconn->set_charset(c->nr);
+					if (HandlerSendOK(command_type, pkt))
+						return true;
+				}
+				break;
+			}
+
+			// try case listed in #1373
+			// SET  @@SESSION.sql_mode = CONCAT(CONCAT(@@sql_mode, ',STRICT_ALL_TABLES'), ',NO_AUTO_VALUE_ON_ZERO'),  @@SESSION.sql_auto_is_null = 0, @@SESSION.wait_timeout = 2147483
+			// this is not a complete solution. A right solution involves true parsing
+			string nq1 = nq;
+			RE2::GlobalReplace(&nq1, "SESSION.", "");
+			RE2::GlobalReplace(&nq1, "SESSION ", "");
+			RE2::GlobalReplace(&nq1, "session.", "");
+			RE2::GlobalReplace(&nq1, "session ", "");
+
+			re2::RE2 r3("^SET @@SQL_MODE *(?:|:)= *(?:'||\")(.*)(?:'||\") *"
+				", *@@sql_auto_is_null *(?:|:)= *(?:(?:\\w|\\d)*) *"
+				", @@wait_timeout *(?:|:)= *(?:\\d*)$", opt2);
+			if (RE2::FullMatch(nq1, r3, &s1)) {
+				SetSqlMode(s1.c_str());
+				if (HandlerSendOK(command_type, pkt))
+					return true;
+			} else {
+				proxy_error("Unable to parse query. If correct, report it as a bug: %s\n", nq.c_str());
+				return false;
+			}
+
+			// no more known hardcodes
+			break;
+		}
+
+		// handle SET ... TIME_ZONE
+		if (match_regexes[2]->match(dig)) {
+			re2::RE2 re("^(?: *)SET *(?:|SESSION +|@@|@@session.)TIME_ZONE *"
+				"(?:|:)= *(?:'||\")((\\w|/|:|\\d|\\+|-)*)(?:'||\") *"
+				"(?:(|;|-- .*|#.*))$", opt2);
+
+			string s;
+			if (RE2::PartialMatch(nq, re, &s)) {
+				SetTimeZone(s.c_str());
+				if (HandlerSendOK(command_type, pkt))
+					return true;
+			} else {
+				proxy_error("Unable to parse query. If correct, report it as a bug: %s\n", nq.c_str());
+				return false;
+			}
+		}
+
+		// no known SET variants matched
+		break;
+	}
+
+	// for mirror session we exit here
+	if (mirror) {
+		current_hostgroup = qpo->destination_hostgroup;
+		return false;
+	}
+
+	if (qpo->cache_ttl > 0) {
+		uint32_t resbuf = 0;
+		uchar *aa = GloQC->get(client_myds->myconn->userinfo->hash,
+			(const uchar *)CurrentQuery.QueryPointer, CurrentQuery.QueryLength ,
+			&resbuf, thread->curtime/1000);
+		if (aa) {
+			l_free(pkt->size, pkt->ptr);
+			client_myds->buffer2resultset(aa, resbuf);
+			free(aa);
+
+			client_myds->PSarrayOUT->copy_add(client_myds->resultset, 0, client_myds->resultset->len);
+			while (client_myds->resultset->len)
+				client_myds->resultset->remove_index(client_myds->resultset->len - 1, NULL);
+			if (transaction_persistent_hostgroup == -1)
+				current_hostgroup = -1; // not active, we can change it
 			RequestEnd(NULL);
 			return true;
 		}
 	}
 
-__exit_set_destination_hostgroup:
-
-	if ( qpo->next_query_flagIN >= 0 ) {
-		next_query_flagIN=qpo->next_query_flagIN;
-	}
-	if ( qpo->destination_hostgroup >= 0 ) {
-		if (transaction_persistent_hostgroup == -1) {
-			current_hostgroup=qpo->destination_hostgroup;
-		}
-	}
+	UpdateFromQPO();
 	return false;
 }
 
@@ -4339,7 +4290,7 @@ void MySQL_Session::set_unhealthy() {
 }
 
 
-unsigned int MySQL_Session::NumActiveTransactions() {
+unsigned int MySQL_Session::NumActiveTransactions() const {
 	unsigned int ret=0;
 	if (mybes==0) return ret;
 	MySQL_Backend *_mybe;

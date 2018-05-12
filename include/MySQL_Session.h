@@ -208,7 +208,11 @@ class MySQL_Session
 	void SQLite3_to_MySQL(SQLite3_result *, char *, int , MySQL_Protocol *);
 	void MySQL_Result_to_MySQL_wire(MYSQL *mysql, MySQL_ResultSet *MyRS, MySQL_Data_Stream *_myds=NULL);
 	void MySQL_Stmt_Result_to_MySQL_wire(MYSQL_STMT *stmt, MySQL_Connection *myconn);
-	unsigned int NumActiveTransactions();
+	unsigned int NumActiveTransactions() const;
+	uint16_t GetServerStatus() const;
+	void SetSqlMode(const char *s);
+	void SetTimeZone(const char *s);
+	bool HandlerSendOK(uint command_type, PtrSize_t *pkt);
 	bool HasOfflineBackends();
 	int FindOneActiveTransaction();
 	unsigned long long IdleTime();
